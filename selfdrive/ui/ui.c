@@ -34,11 +34,6 @@
 
 #include "cereal/gen/c/log.capnp.h"
 
-// Calibration status values from controlsd.py
-#define CALIBRATION_UNCALIBRATED 0
-#define CALIBRATION_CALIBRATED 1
-#define CALIBRATION_INVALID 2
-
 #define STATUS_STOPPED 0
 #define STATUS_DISENGAGED 1
 #define STATUS_ENGAGED 2
@@ -101,7 +96,7 @@ const mat3 intrinsic_matrix = (mat3){{
 typedef struct UIScene {
   int frontview;
   int fullview;
-	
+
   int transformed_width, transformed_height;
 
   uint64_t model_ts;
@@ -143,6 +138,7 @@ typedef struct UIScene {
   float awareness_status;
 
   uint64_t started_ts;
+
   //BB CPU TEMP
   uint16_t maxCpuTemp;
   uint32_t maxBatTemp;
@@ -151,9 +147,6 @@ typedef struct UIScene {
   float angleSteers;
   float angleSteersDes;
   //BB END CPU TEMP
-  // Used to display calibration progress
-  int cal_status;
-  int cal_perc;
 
   // Used to show gps planner status
   bool gps_planner_active;
@@ -414,7 +407,7 @@ static void ui_init(UIState *s) {
 
   assert(s->img_face >= 0);
   s->img_face = nvgCreateImage(s->vg, "../assets/img_driver_face.png", 1);
-	
+
   // init gl
   s->frame_program = load_program(frame_vertex_shader, frame_fragment_shader);
   assert(s->frame_program);
@@ -497,7 +490,6 @@ static void ui_init_vision(UIState *s, const VisionStreamBufs back_bufs,
   s->scene = (UIScene){
       .frontview = getenv("FRONTVIEW") != NULL,
       .fullview = getenv("FULLVIEW") != NULL,
-      .cal_status = CALIBRATION_CALIBRATED,
       .transformed_width = ui_info.transformed_width,
       .transformed_height = ui_info.transformed_height,
       .front_box_x = ui_info.front_box_x,
@@ -1488,16 +1480,6 @@ static void ui_draw_vision_alert(UIState *s, int va_size, int va_color,
   }
 }
 
-static void ui_draw_calibration_status(UIState *s) {
-  const UIScene *scene = &s->scene;
-  char calib_str1[64];
-  char calib_str2[64];
-  snprintf(calib_str1, sizeof(calib_str1), "Calibration in Progress: %d%%", scene->cal_perc);
-  snprintf(calib_str2, sizeof(calib_str2), (s->is_metric?"Drive above 35 km/h":"Drive above 15 mph"));
-
-  ui_draw_vision_alert(s, ALERTSIZE_MID, s->status, calib_str1, calib_str2);
-}
-
 static void ui_draw_vision(UIState *s) {
   const UIScene *scene = &s->scene;
   int ui_viz_rx = scene->ui_viz_rx;
@@ -1541,11 +1523,8 @@ static void ui_draw_vision(UIState *s) {
     // Controls Alerts
     ui_draw_vision_alert(s, s->scene.alert_size, s->status,
                             s->scene.alert_text1, s->scene.alert_text2);
-  } else if (scene->cal_status == CALIBRATION_UNCALIBRATED) {
-    // Calibration Status
-    ui_draw_calibration_status(s);
-   } else {
-     ui_draw_vision_footer(s);
+  } else {
+    ui_draw_vision_footer(s);
   }
 
   nvgEndFrame(s->vg);
@@ -1943,9 +1922,6 @@ static void ui_update(UIState *s) {
         struct cereal_LiveCalibrationData datad;
         cereal_read_LiveCalibrationData(&datad, eventd.liveCalibration);
 
-        s->scene.cal_status = datad.calStatus;
-        s->scene.cal_perc = datad.calPerc;
-
         // should we still even have this?
         capn_list32 warpl = datad.warpMatrix2;
         capn_resolve(&warpl.p);  // is this a bug?
@@ -2188,6 +2164,20 @@ static void* bg_thread(void* args) {
   return NULL;
 }
 
+int is_leon() {
+  #define MAXCHAR 1000
+  FILE *fp;
+  char str[MAXCHAR];
+  char* filename = "/proc/cmdline";
+   fp = fopen(filename, "r");
+  if (fp == NULL){
+    printf("Could not open file %s",filename);
+    return 0;
+  }
+  fgets(str, MAXCHAR, fp);
+  fclose(fp);
+  return strstr(str, "letv") != NULL;
+}
 
 int main() {
   int err;
@@ -2219,14 +2209,15 @@ int main() {
   touch_init(&touch);
 
   // light sensor scaling params
-  #define LIGHT_SENSOR_M 1.3
-  #define LIGHT_SENSOR_B 5.0
+  const int EON = (access("/EON", F_OK) != -1);
+  const int LEON = is_leon();
+
+  const float BRIGHTNESS_B = LEON? 10.0 : 5.0;
+  const float BRIGHTNESS_M = LEON? 2.6 : 1.3;
 
   #define NEO_BRIGHTNESS 100
 
-  float smooth_light_sensor = LIGHT_SENSOR_B;
-
-  const int EON = (access("/EON", F_OK) != -1);
+  float smooth_brightness = BRIGHTNESS_B;
 
   while (!do_exit) {
     bool should_swap = false;
@@ -2235,10 +2226,10 @@ int main() {
     if (EON) {
       // light sensor is only exposed on EONs
 
-      float clipped_light_sensor = (s->light_sensor*LIGHT_SENSOR_M) + LIGHT_SENSOR_B;
-      if (clipped_light_sensor > 255) clipped_light_sensor = 255;
-      smooth_light_sensor = clipped_light_sensor * 0.01 + smooth_light_sensor * 0.99;
-      set_brightness(s, (int)smooth_light_sensor);
+      float clipped_brightness = (s->light_sensor*BRIGHTNESS_M) + BRIGHTNESS_B;
+      if (clipped_brightness > 255) clipped_brightness = 255;
+      smooth_brightness = clipped_brightness * 0.01 + smooth_brightness * 0.99;
+      set_brightness(s, (int)smooth_brightness);
     } else {
       // compromise for bright and dark envs
       set_brightness(s, NEO_BRIGHTNESS);
@@ -2273,7 +2264,7 @@ int main() {
     // safe to do this outside the lock?
     if (should_swap) {
       eglSwapBuffers(s->display, s->surface);
-  }
+    }
   }
 
   set_awake(s, true);
